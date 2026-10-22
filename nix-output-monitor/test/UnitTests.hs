@@ -3,6 +3,7 @@ import Data.Set (singleton)
 import NOM.Builds
 import NOM.NixMessage.OldStyle (NixOldStyleMessage (..))
 import NOM.Parser
+import NOM.ProgramStatus (Report (..), Status (..), encodeReport)
 import NOM.Util (parseOne)
 import Relude
 import Relude.Unsafe qualified as Unsafe
@@ -119,5 +120,41 @@ main = do
               "result matches"
               (Failed (Derivation $ StorePath "d055cqki6z1vll144kvj496cknwvwi44" "build-fail") (ExitCode 1))
               result
+        , "Encode program status report" ~: do
+            assertEqual
+              "working report"
+              "\ESC]7501;state=working:app=nom:progress=42\ESC\\"
+              (encodeReport (MkReport Working (Just 42) Nothing))
+            assertEqual
+              "error report with message"
+              "\ESC]7501;state=error:app=nom:msg=MSBmYWlsZWQ=\ESC\\"
+              (encodeReport (MkReport Error Nothing (Just "1 failed")))
+            assertEqual
+              "idle report"
+              "\ESC]7501;state=idle:app=nom\ESC\\"
+              (encodeReport (MkReport Idle Nothing Nothing))
+            assertEqual
+              "done report"
+              "\ESC]7501;state=done:app=nom\ESC\\"
+              (encodeReport (MkReport Done Nothing Nothing))
+        , "Encode program status message without control characters" ~: do
+            assertEqual
+              "control characters are replaced with spaces"
+              (encodeReport (MkReport Idle Nothing (Just "a b c d")))
+              (encodeReport (MkReport Idle Nothing (Just "a\nb\tc\x85\&d")))
+        , "Truncate program status message on a character boundary" ~: do
+            -- The limit is 2048 bytes and "é" takes two.
+            let aTimes n = toText (replicate n 'a')
+            assertBool
+              "a message of exactly 2048 bytes is kept"
+              (encodeReport (MkReport Done Nothing (Just (aTimes 2048))) /= encodeReport (MkReport Done Nothing (Just (aTimes 2047))))
+            assertEqual
+              "multi-byte character crossing the limit is dropped"
+              (encodeReport (MkReport Done Nothing (Just (aTimes 2047))))
+              (encodeReport (MkReport Done Nothing (Just (aTimes 2047 <> "é"))))
+            assertEqual
+              "multi-byte character ending at the limit is kept"
+              (encodeReport (MkReport Done Nothing (Just (aTimes 2046 <> "é"))))
+              (encodeReport (MkReport Done Nothing (Just (aTimes 2046 <> "éa"))))
         ]
   if errors counts + failures counts == 0 then exitSuccess else exitFailure

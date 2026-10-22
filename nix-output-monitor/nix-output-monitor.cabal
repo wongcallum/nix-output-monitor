@@ -65,6 +65,7 @@ common common-config
     async,
     attoparsec,
     base >=4.10 && <5.0,
+    base64-bytestring,
     bytestring,
     cassava,
     containers,
@@ -129,6 +130,7 @@ library
     NOM.Print.ProgressBar.Char
     NOM.Print.Table
     NOM.Print.Tree
+    NOM.ProgramStatus
     NOM.State
     NOM.State.CacheId
     NOM.State.CacheId.Map

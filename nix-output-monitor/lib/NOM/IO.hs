@@ -14,6 +14,7 @@ import NOM.Builds (StorePath, parseStorePath, storePrefix)
 import NOM.Error (NOMError)
 import NOM.Print (Config (..))
 import NOM.Print.Table as Table (bold, displayWidth, displayWidthBS, markup, red, truncate)
+import NOM.ProgramStatus (Report, encodeReport)
 import NOM.Update.Monad (CheckStorePathEnv (..), UpdateMonad, getNow)
 import Relude
 import Streamly.Data.Fold qualified as Fold
@@ -33,6 +34,8 @@ type Output = Text
 type UpdateFunc update state = forall m. (UpdateMonad m) => update -> StateT state m ([NOMError], ByteString, Bool)
 
 type OutputFunc state = state -> Maybe Window -> (ZonedTime, Double) -> Output
+
+type ReportFunc state = state -> Report
 
 type Finalizer state = forall m. (MonadIO m, UpdateMonad m) => StateT state m ()
 
@@ -73,9 +76,10 @@ writeStateToScreen ::
   TVar Bool ->
   (Double -> state -> state) ->
   OutputFunc state ->
+  Maybe (ReportFunc state, TVar (Maybe Report)) ->
   Handle ->
   IO ()
-writeStateToScreen pad printed_lines_var nom_state_var nix_output_buffer_var refresh_display_var maintenance printer output_handle = do
+writeStateToScreen pad printed_lines_var nom_state_var nix_output_buffer_var refresh_display_var maintenance printer program_status output_handle = do
   nowClock <- getZonedTime
   now <- getNow
   terminalSize <-
@@ -98,6 +102,14 @@ writeStateToScreen pad printed_lines_var nom_state_var nix_output_buffer_var ref
     nix_output_raw <- swapTVar nix_output_buffer_var []
     pure (nom_state, nix_output_raw)
   -- ====
+
+  -- We only send a program status report when it has changed since the last one we sent.
+  program_status_output <- case program_status of
+    Nothing -> pure mempty
+    Just (reporter, last_report_var) -> do
+      let report = reporter nom_state
+      last_report <- atomically $ swapTVar last_report_var (Just report)
+      pure $ memptyIfFalse (last_report /= Just report) (Builder.byteString (encodeReport report))
 
   let nix_output = ByteString.lines $ ByteString.concat $ reverse nix_output_raw
       nix_output_length = length nix_output
@@ -165,6 +177,7 @@ writeStateToScreen pad printed_lines_var nom_state_var nix_output_buffer_var ref
           )
           -- Corner case: If nom is not outputting anything but we are printing output from nix, then we want to append a newline
           <> memptyIfFalse (nom_output_length == 0 && nix_output_length > 0) Builder.byteString "\n"
+          <> program_status_output
           <> endAtomicUpdate
 
   -- Actually write to the buffer. We do this all in one step and with a strict
@@ -205,13 +218,14 @@ interact ::
   UpdateFunc update state ->
   (Double -> state -> state) ->
   OutputFunc state ->
+  ReportFunc state ->
   Finalizer state ->
   Stream (Either NOMError ByteString) ->
   Handle ->
   state ->
   IO state
-interact config parser updater maintenance printer finalize input_stream output_handle initialState =
-  processTextStream config parser updater maintenance (Just (printer, output_handle)) finalize initialState input_stream
+interact config parser updater maintenance printer reporter finalize input_stream output_handle initialState =
+  processTextStream config parser updater maintenance (Just (printer, reporter, output_handle)) finalize initialState input_stream
 
 -- frame durations are passed to threadDelay and thus are given in microseconds
 
@@ -255,7 +269,7 @@ processTextStream ::
   StreamParser update ->
   UpdateFunc update state ->
   (Double -> state -> state) ->
-  Maybe (OutputFunc state, Handle) ->
+  Maybe (OutputFunc state, ReportFunc state, Handle) ->
   Finalizer state ->
   state ->
   Stream (Either NOMError ByteString) ->
@@ -274,8 +288,9 @@ processTextStream config parser updater maintenance printerMay finalize initialS
             & Stream.fold (Fold.drainMapM (runUpdate check_path_env output_builder_var state_var refresh_display_var updater))
         waitForInput :: IO ()
         waitForInput = atomically $ check =<< readTVar refresh_display_var
-    printerMay & maybe keepProcessing \(printer, output_handle) -> do
+    printerMay & maybe keepProcessing \(printer, reporter, output_handle) -> do
       linesVar <- newTVarIO 0
+      last_report_var <- newTVarIO Nothing
       let writeToScreen :: IO ()
           writeToScreen =
             writeStateToScreen
@@ -286,6 +301,7 @@ processTextStream config parser updater maintenance printerMay finalize initialS
               refresh_display_var
               maintenance
               printer
+              (guard config.programStatus $> (reporter, last_report_var))
               output_handle
           keepPrinting :: IO ()
           keepPrinting = forever do

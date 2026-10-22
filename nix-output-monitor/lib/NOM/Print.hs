@@ -121,6 +121,8 @@ defaultTreeWidth = 60
 data Config = MkConfig
   { silent :: Bool
   , piping :: Bool
+  , programStatus :: Bool
+  -- ^ Whether to report progress to the terminal via OSC 7501, see "NOM.ProgramStatus".
   }
 
 printSections :: NonEmpty Text -> Text

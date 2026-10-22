@@ -17,6 +17,7 @@ import NOM.IO.Input.OldStyle (OldStyleInput)
 import NOM.NixMessage.JSON (NixJSONMessage)
 import NOM.Print (Config (..), stateToText)
 import NOM.Print.Table (markup, red)
+import NOM.ProgramStatus (Report (..), Status (Done, Idle), encodeReport, stateToReport)
 import NOM.State (DependencySummary (..), NOMState (..), ProgressState (..))
 import NOM.State.CacheId.Map qualified as CMap
 import NOM.State.Initial (initialStateFromBuildPlatform)
@@ -29,6 +30,7 @@ import Relude
 import System.Console.ANSI qualified as Terminal
 import System.Console.Terminal.Size (Window)
 import System.Environment qualified as Environment
+import System.IO (hIsTerminalDevice)
 import System.IO.Error qualified as IOError
 import System.Posix qualified as System
 import System.Posix.Signals qualified as Signals
@@ -52,7 +54,25 @@ defaultConfig =
   MkConfig
     { piping = False
     , silent = False
+    , programStatus = False
     }
+
+{- | Whether to report progress to the terminal via the Program Status Protocol (OSC 7501).
+NOM_PROGRAM_STATUS=1 turns it on and NOM_PROGRAM_STATUS=0 turns it off, otherwise it is off for now.
+Like Buildkite’s bk we never report when stderr is not a terminal, TERM is dumb or we are running in CI,
+because CI systems which run jobs in a pseudo-terminal would capture the escape sequences in their logs.
+-}
+programStatusEnabled :: IO Bool
+programStatusEnabled = do
+  requested <-
+    lookupEnv "NOM_PROGRAM_STATUS" <&> \case
+      Just "1" -> True
+      Just "0" -> False
+      _ -> False
+  is_terminal <- hIsTerminalDevice outputHandle
+  term <- lookupEnv "TERM"
+  ci <- lookupEnv "CI"
+  pure $ requested && is_terminal && term /= Just "dumb" && maybe True null ci
 
 replaceCommandWithExit :: [String] -> [String]
 replaceCommandWithExit = (<> ["--command", "sh", "-c", "exit"]) . takeWhile (\x -> x /= "--command" && x /= "-c")
@@ -75,37 +95,39 @@ main = do
 
   lookupEnv "NIX_GET_COMPLETIONS" >>= \case
     Just _ -> printNixCompletion prog_name args
-    Nothing -> runApp prog_name args
+    Nothing -> do
+      program_status <- programStatusEnabled
+      runApp defaultConfig{programStatus = program_status} prog_name args
 
-runApp :: String -> [String] -> IO Void
-runApp = \cases
+runApp :: Config -> String -> [String] -> IO Void
+runApp config = \cases
   _ ["--version"] -> do
     hPutStrLn stderr ("nix-output-monitor " <> fromString (showVersion version))
     exitWith =<< runProcess (proc "nix" ["--version"])
   "nom-build" args | "--help" `elem` args -> runNixHelpCommand "nix-build" args
-  "nom-build" args -> exitWith =<< runMonitoredCommand defaultConfig (proc "nix-build" (withJSON args))
+  "nom-build" args -> exitWith =<< runMonitoredCommand config (proc "nix-build" (withJSON args))
   "nom-shell" args -> do
-    exitOnFailure =<< runMonitoredCommand defaultConfig{silent = True} (proc "nix-shell" (withJSON args <> ["--run", "exit"]))
+    exitOnFailure =<< runMonitoredCommand config{silent = True} (proc "nix-shell" (withJSON args <> ["--run", "exit"]))
     exitWith =<< runProcess (proc "nix-shell" args)
   "nom" ("build" : args) | "--help" `elem` args -> runNixHelpCommand "nix" ("build" : args)
-  "nom" ("build" : args) -> exitWith =<< runMonitoredCommand defaultConfig (proc "nix" ("build" : withJSON args))
+  "nom" ("build" : args) -> exitWith =<< runMonitoredCommand config (proc "nix" ("build" : withJSON args))
   "nom" ("copy" : args) | "--help" `elem` args -> runNixHelpCommand "nix" ("copy" : args)
-  "nom" ("copy" : args) -> exitWith =<< runMonitoredCommand defaultConfig (proc "nix" ("copy" : withJSON args))
+  "nom" ("copy" : args) -> exitWith =<< runMonitoredCommand config (proc "nix" ("copy" : withJSON args))
   "nom" ("shell" : args) -> do
-    exitOnFailure =<< runMonitoredCommand defaultConfig{silent = True} (proc "nix" ("shell" : withJSON (replaceCommandWithExit args)))
+    exitOnFailure =<< runMonitoredCommand config{silent = True} (proc "nix" ("shell" : withJSON (replaceCommandWithExit args)))
     exitWith =<< runProcess (proc "nix" ("shell" : args))
   "nom" ("develop" : args) -> do
-    exitOnFailure =<< runMonitoredCommand defaultConfig{silent = True} (proc "nix" ("develop" : withJSON (replaceCommandWithExit args)))
+    exitOnFailure =<< runMonitoredCommand config{silent = True} (proc "nix" ("develop" : withJSON (replaceCommandWithExit args)))
     exitWith =<< runProcess (proc "nix" ("develop" : args))
   "nom" ("flake" : args) | "--help" `elem` args -> runNixHelpCommand "nix" ("flake" : args)
-  "nom" ("flake" : args) -> exitWith =<< runMonitoredCommand defaultConfig (proc "nix" ("flake" : withJSON args))
+  "nom" ("flake" : args) -> exitWith =<< runMonitoredCommand config (proc "nix" ("flake" : withJSON args))
   "nom" [] -> do
-    finalState <- monitorHandle OldStyleInput defaultConfig{piping = True} stdin
+    finalState <- monitorHandle OldStyleInput config{piping = True} stdin
     if CMap.size finalState.fullSummary.failedBuilds + length finalState.nixErrors == 0
       then exitSuccess
       else exitFailure
   "nom" ["--json"] -> do
-    finalState <- monitorHandle NixJSONMessage defaultConfig{piping = True} stdin
+    finalState <- monitorHandle NixJSONMessage config{piping = True} stdin
     if CMap.size finalState.fullSummary.failedBuilds + length finalState.nixErrors == 0
       then exitSuccess
       else exitFailure
@@ -185,11 +207,21 @@ monitorHandle update config input_handle = withParser \streamParser -> do
       current_system <- Exception.handle ((Nothing <$) . printIOException) $ Just . decodeUtf8 <$> Process.readProcessStdout_ (Process.proc "nix" ["eval", "--extra-experimental-features", "nix-command", "--impure", "--raw", "--expr", "builtins.currentSystem"])
       first_state <- initialStateFromBuildPlatform current_system
       let first_process_state = MkProcessState first_state (stateToText config first_state)
-      interact @update config streamParser (processStateUpdater config) (\now -> #updaterState %~ maintainState now) (.printFunction) (finalizer config) (inputStream update input_handle) outputHandle first_process_state
+      interact @update config streamParser (processStateUpdater config) (\now -> #updaterState %~ maintainState now) (.printFunction) (programStatusReport config) (finalizer config) (inputStream update input_handle) outputHandle first_process_state
+      -- When we get interrupted or crash we tell the terminal that we have stopped working.
+      `Exception.onException` when config.programStatus (ByteString.hPut outputHandle (encodeReport (MkReport Idle Nothing Nothing)))
       `Exception.finally` do
         Terminal.hShowCursor outputHandle
         ByteString.hPut outputHandle "\n" -- We print a new line after finish, because in normal nom state the last line is not empty.
   pure finalState.updaterState
+
+{- | Silent runs hand the terminal over to an interactive shell after they have finished,
+so instead of leaving a finished record behind for the user to find, we report that we are idle.
+-}
+programStatusReport :: Config -> ProcessState -> Report
+programStatusReport config process_state = case stateToReport process_state.updaterState of
+  MkReport Done progress message | config.silent -> MkReport Idle progress message
+  report -> report
 
 {-# INLINE processStateUpdater #-}
 processStateUpdater ::
